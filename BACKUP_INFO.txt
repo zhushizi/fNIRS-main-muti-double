@@ -1,0 +1,6 @@
+﻿Backup commit: 5374611e9d122d4d6572f5e09600f2d0af848b1c
+Subject: refactor(software): 鐢?WAVELENGTH_CHANNELS 缁熶竴娉㈤暱涓庨厤瀵归€昏緫
+Author: zzhou <zhouzhenghao1998@163.com>
+Date: 2026-05-18 16:45:02 +0800
+Exported from fNIRS-main without modifying working tree.
+Created: 2026-06-03 13:54:53
