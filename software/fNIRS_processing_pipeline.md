@@ -1,7 +1,7 @@
-# 单通道 fNIRS 处理链路说明
+# 双接收源五波长 fNIRS 处理链路说明
 
 本文档说明当前 `software/fNIRS_processing.py` 的单通道处理链路。  
-当前版本已不再使用旧的 64B 多组协议，而是采用 **26B 带帧头/校验/ACK** 的单通道协议。
+当前版本已不再使用旧的 64B 多组协议，而是采用 **26B 带帧头/校验/ACK** 的双接收源五波长协议。
 
 ---
 
@@ -15,14 +15,13 @@
   -> threshold_filter
   -> butter_lowpass_filter
   -> sliding_window_rms
-  -> interleave_mode_blocks
+  -> aggregate_wavelength_cycles
   -> interleaved_output.csv
   -> process_csv_dataset
-      -> 660/940 配对
+      -> 2 接收源 x 5 波长矩阵
       -> intensities_to_od_changes
       -> smart_bandpass
-      -> mbll
-      -> cbsi
+      -> generalized_mbll
   -> processed_output.csv
 ```
 
@@ -70,20 +69,19 @@ payload 共 21 字节，目前使用：
 
 | 字节 | 含义 |
 |------|------|
-| 0 | 波长编号：`0x00=未点亮`，`0x01=940nm`，`0x02=660nm` |
-| 1 | 传感器编号：当前固定 `0x00`（单个传感器模块 `S1_D1`） |
-| 2 | 采集值低字节 |
-| 3 | 采集值高字节 |
-| 4-19 | 保留 |
+| 0 | 波长编号：`0x00=未点亮`，`0x01=850nm`，`0x02=810nm`，`0x03=770nm`，`0x04=730nm`，`0x05=700nm` |
+| 1 | 接收源编号：`0x01=PD1/S1_D1`，`0x02=PD2/S1_D2` |
+| 2-5 | 采集值，4 字节无符号大端 |
+| 6-19 | 保留 |
 | 20 | 保留位，当前固定 `0x00` |
 
-单个数据帧只携带 **一个通道、一个波长下的一次采样值**。
+单个数据帧只携带 **一个接收源、一个波长下的一次采样值**。
 
 说明：
 
-- 当前上位机里，`payload byte0` 的**波长编号**同时承担了原先“emitter-state”的语义（含未点亮 `0x00`）。
-- **`0x00` 行在 `run_pipeline` 读入 `all_groups.csv` 后即丢弃**，不参与 RMS 切段与 660/940 交错配对。
-- 分段、配对、MBLL 组织仍只依赖 CSV 中的 `Wavelength` 列（有效值仅为 `1` 与 `2`）。
+- 当前上位机里，`payload byte0` 表示 LED 波长，`payload byte1` 表示 PD 接收源。
+- **`0x00` 行在 `run_pipeline` 读入 `all_groups.csv` 后即丢弃**，不参与 RMS 切段与周期聚合。
+- 预期上报周期为每个波长依次 PD1 / PD2，共 `5 x 2 = 10` 帧。
 
 ---
 
@@ -103,17 +101,18 @@ payload 共 21 字节，目前使用：
 ### 3.2 `all_groups.csv` 结构
 
 ```text
-Time (s),SensorId,S1_D1,Wavelength
+Time (s),DetectorId,Channel,Wavelength,Value
 ```
 
 字段说明：
 
 - `Time (s)`：接收该帧时的相对时间
-- `SensorId`：传感器编号，当前固定为 `0`
-- `S1_D1`：当前单通道采样值
-- `Wavelength`：波长编号（`0=未点亮`，`1=940`，`2=660`；流水线中会去掉 `0`）
+- `DetectorId`：接收源编号，`1=PD1/S1_D1`，`2=PD2/S1_D2`
+- `Channel`：通道名
+- `Wavelength`：波长编号（流水线中会去掉 `0`）
+- `Value`：当前采样值
 
-这里不再有 `Short / Long1 / Long2`，因为当前几何只有 **单物理通道 `S1_D1`**。
+当前几何包含 `S1_D1=3.0cm` 与 `S1_D2=1.0cm`。
 
 ---
 
@@ -142,20 +141,19 @@ Time (s),SensorId,S1_D1,Wavelength
 - 用一个稳定值代表同一波长时隙
 - 方便后续 660 / 940 配对
 
-### 4.4 模式交错 `interleave_mode_blocks`
+### 4.4 周期聚合 `aggregate_wavelength_cycles`
 
-- 将相邻的两个波长块成对处理
-- 自动识别哪一块对应 660，哪一块对应 940
-- 当两块长度不一致时，按较短块长度截断（不做末值补齐）
-- 生成一行一对的输出
+- 将 RMS 后的 `(DetectorId, Wavelength)` 段按周期聚合
+- 凑齐 `S1_D1/S1_D2 x 850/810/770/730/700nm` 后输出一行
+- 若周期内遇到重复组合，认为缺帧并重启当前周期
 
 ### 4.5 `interleaved_output.csv` 结构
 
 ```text
-Time (s),S1_D1_660,S1_D1_940
+Time (s),S1_D1_850,S1_D1_810,S1_D1_770,S1_D1_730,S1_D1_700,S1_D2_850,...
 ```
 
-每一行表示一组已经对齐好的双波长样本。
+每一行表示一组已经对齐好的 2 接收源 x 5 波长样本。
 
 ---
 
@@ -166,20 +164,9 @@ Time (s),S1_D1_660,S1_D1_940
 输入：`interleaved_output.csv`  
 输出：`processed_output.csv`
 
-### 5.1 双波长配对
+### 5.1 五波长矩阵
 
-当前已不需要旧版本那种：
-
-- 8 组
-- 每组 3 路
-- 共 48 个样本量
-
-现在直接从 `interleaved_output.csv` 中取：
-
-- `S1_D1_660`
-- `S1_D1_940`
-
-组合为形状 `(2, N)` 的样本矩阵。
+每个接收源独立从 `interleaved_output.csv` 中取 5 个波长列，组合为形状 `(5, N)` 的样本矩阵。
 
 ### 5.2 `build_channel_info`
 
@@ -200,27 +187,33 @@ delta_od = nsp.intensities_to_od_changes(samples)
 - 默认带通：`0.05 ~ 0.1 Hz`
 - 样本太短时自动跳过滤波
 
-### 5.5 MBLL 与 CBSI
+### 5.5 广义 MBLL
 
-使用单通道的：
+使用五波长最小二乘 / 伪逆求解：
 
-- `channel_names = [S1_D1, S1_D1]`
-- `wavelengths = [660, 940]`
-- `distances = [3.0, 3.0]`
+- `S1_D1` 距离 `3.0cm`
+- `S1_D2` 距离 `1.0cm`
+- 色团输出 `hbo / hbr / cyt`
 
 最终输出：
 
 - `S1_D1_hbo`
 - `S1_D1_hbr`
+- `S1_D1_cyt`
+- `S1_D2_hbo`
+- `S1_D2_hbr`
+- `S1_D2_cyt`
 
 ### 5.6 `processed_output.csv` 结构
 
 ```text
-Time,S1_D1_hbo,S1_D1_hbr
+Time,S1_D1_hbo,S1_D1_hbr,S1_D1_cyt,S1_D2_hbo,S1_D2_hbr,S1_D2_cyt
 ```
 
-这仍然保持旧版的输出风格：  
+这仍然保持旧版的输出风格：
 第一列时间，后面采用 `{ChannelName}_{Type}` 形式。
+
+注意：当前 `cyt` 使用 `config.CYT_DIFFERENCE_EXTINCTION`，来源为 UCL-NIR-Spectra 的 cytochrome oxidase 差分消光谱（OD / cm / mM），矩阵内会转换为 OD / cm / M 以匹配 HbO/HbR；结果仍建议结合实验标定验证。
 
 ---
 

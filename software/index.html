@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>fNIRS 单通道控制面板</title>
+  <title>fNIRS 双接收源五波长控制面板</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css">
   <style>
     body { background: #f7f7f9; }
@@ -20,7 +20,7 @@
           <div class="card-header">协议控制</div>
           <div class="card-body">
             <p class="text-muted">
-              当前页面按 26B 协议发送 `0x01` 指令帧，并等待 `0x03` ACK。
+              当前页面按 26B 协议发送 `0x01` 指令帧。默认强度位为 `0x64`，通道选择位为 `0x01`。
             </p>
             <div class="form-group form-check">
               <input type="checkbox" class="form-check-input" id="streamEnabled">
@@ -28,7 +28,7 @@
             </div>
             <div class="form-group">
               <label for="intensityMa">光强 / 电流值</label>
-              <input type="number" class="form-control mono" id="intensityMa" min="0" max="255" value="200">
+              <input type="number" class="form-control mono" id="intensityMa" min="0" max="255" value="100">
             </div>
             <button class="btn btn-dark btn-block" id="sendButton">发送控制命令</button>
             <div class="mt-3">
@@ -49,8 +49,9 @@
             <table class="table table-sm">
               <tbody>
                 <tr><th>时间</th><td id="latestTimestamp" class="mono">-</td></tr>
-                <tr><th>波长编号</th><td id="latestWavelength" class="mono">-</td></tr>
-                <tr><th>传感器编号</th><td id="latestSensorId" class="mono">-</td></tr>
+                <tr><th>波长</th><td id="latestWavelength" class="mono">-</td></tr>
+                <tr><th>接收源</th><td id="latestDetectorId" class="mono">-</td></tr>
+                <tr><th>通道</th><td id="latestChannel" class="mono">-</td></tr>
                 <tr><th>采集值</th><td id="latestValue" class="mono">-</td></tr>
                 <tr><th>实时采样率</th><td id="samplingRateHz" class="mono">-</td></tr>
               </tbody>
@@ -67,7 +68,8 @@
                   <tr>
                     <th>时间</th>
                     <th>波长</th>
-                    <th>传感器</th>
+                    <th>接收源</th>
+                    <th>通道</th>
                     <th>值</th>
                   </tr>
                 </thead>
@@ -86,9 +88,20 @@
 
     function wavelengthLabel(code) {
       if (code === 0) return "0x00 / 未点亮";
-      if (code === 1) return "0x01 / 940nm";
-      if (code === 2) return "0x02 / 660nm";
+      if (code === 1) return "0x01 / 850nm";
+      if (code === 2) return "0x02 / 810nm";
+      if (code === 3) return "0x03 / 770nm";
+      if (code === 4) return "0x04 / 730nm";
+      if (code === 5) return "0x05 / 700nm";
       return "0x" + Number(code ?? 0).toString(16).toUpperCase().padStart(2, "0");
+    }
+
+    function detectorLabel(packet) {
+      const detectorId = packet?.detector_id ?? packet?.sensor_id;
+      if (detectorId === 1) return "0x01 / PD1";
+      if (detectorId === 2) return "0x02 / PD2";
+      if (detectorId == null) return "-";
+      return "0x" + Number(detectorId).toString(16).toUpperCase().padStart(2, "0");
     }
 
     async function refreshStatus() {
@@ -115,7 +128,8 @@
       const latest = data.latest_packet;
       document.getElementById("latestTimestamp").textContent = latest ? latest.timestamp : "-";
       document.getElementById("latestWavelength").textContent = latest ? wavelengthLabel(latest.wavelength_code) : "-";
-      document.getElementById("latestSensorId").textContent = latest ? latest.sensor_id : "-";
+      document.getElementById("latestDetectorId").textContent = latest ? detectorLabel(latest) : "-";
+      document.getElementById("latestChannel").textContent = latest ? (latest.channel || "-") : "-";
       document.getElementById("latestValue").textContent = latest ? latest.value : "-";
       const rateHz = data.sampling_rate_hz;
       document.getElementById("samplingRateHz").textContent = rateHz != null ? rateHz + " Hz" : "-";
@@ -127,7 +141,8 @@
         row.innerHTML = `
           <td class="mono">${packet.timestamp}</td>
           <td class="mono">${wavelengthLabel(packet.wavelength_code)}</td>
-          <td class="mono">${packet.sensor_id}</td>
+          <td class="mono">${detectorLabel(packet)}</td>
+          <td class="mono">${packet.channel || "-"}</td>
           <td class="mono">${packet.value}</td>
         `;
         historyBody.appendChild(row);

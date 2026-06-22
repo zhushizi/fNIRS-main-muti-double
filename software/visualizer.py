@@ -1,5 +1,5 @@
 """
-轻量级单通道控制面板后端。
+轻量级双接收源五波长控制面板后端。
 
 它做三件事：
 1. 提供网页接口（Flask）
@@ -21,14 +21,14 @@ from flask import Flask, jsonify, request, send_from_directory
 from config import (
     ACK_TIMEOUT_SECONDS,
     BAUD_RATE,
+    DETECTOR_CHANNELS,
     DEFAULT_INTENSITY_MA,
     MAX_RETRIES,
     SERIAL_PORT,
     TIMEOUT,
     FRAME_TYPE_ACK,
     FRAME_TYPE_DATA,
-    WAVELENGTH_660_CODE,
-    WAVELENGTH_940_CODE,
+    WAVELENGTH_CHANNELS,
 )
 from protocol import (
     FrameReader,
@@ -108,14 +108,18 @@ def serial_reader_loop() -> None:
     while not stop_reader.is_set():
         if demo_mode:
             t = time.time()
-            wave_code = WAVELENGTH_660_CODE if int(t * 2) % 2 == 0 else WAVELENGTH_940_CODE
-            value = int(2000 + 300 * math.sin(t * 2))
-            # demo 模式下直接伪造一条交替波长的数据，方便前端调试界面。
+            cycle_items = [(wl, det) for wl in WAVELENGTH_CHANNELS for det in DETECTOR_CHANNELS]
+            wl, det = cycle_items[int(t * 10) % len(cycle_items)]
+            value = int(2000 + 300 * math.sin(t * 2 + wl.code + det.code))
+            # demo 模式下伪造 5 波长 x 2 接收源数据，方便前端调试界面。
             _append_packet(
                 {
                     "timestamp": round(t, 3),
-                "sensor_id": 0,
-                    "wavelength_code": wave_code,
+                    "sensor_id": det.code,
+                    "detector_id": det.code,
+                    "channel": det.name,
+                    "wavelength_code": wl.code,
+                    "wavelength_nm": wl.emitter_nm,
                     "value": value,
                 }
             )
@@ -141,7 +145,10 @@ def serial_reader_loop() -> None:
             {
                 "timestamp": round(time.time(), 3),
                 "sensor_id": int(sample.sensor_id),
+                "detector_id": int(sample.detector_code),
+                "channel": sample.channel_name,
                 "wavelength_code": int(sample.wavelength_code),
+                "wavelength_nm": sample.wavelength_nm,
                 "value": int(sample.value),
             }
         )

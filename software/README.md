@@ -1,7 +1,7 @@
-# fNIRS Single-Channel Software
+# fNIRS Dual-Detector Five-Wavelength Software
 
-This directory contains the host-side software for the **single-channel** fNIRS workflow.  
-It targets the new **26-byte framed serial protocol** and assumes one physical channel, `S1_D1`, sampled under two wavelengths (`660nm` and `940nm`).
+This directory contains the host-side software for the **dual-detector five-wavelength** fNIRS workflow.  
+It targets the **26-byte framed serial protocol** and assumes one source with two detector channels, `S1_D1` and `S1_D2`, sampled under five wavelengths (`850 / 810 / 770 / 730 / 700nm`).
 
 ## Core Features
 
@@ -11,20 +11,21 @@ It targets the new **26-byte framed serial protocol** and assumes one physical c
   - checksum validation
   - `0x03` ACK handling with retry support
 
-- **Single-channel acquisition**
+- **Dual-detector acquisition**
   - one intensity value per data frame
-  - wavelength code and sensor id included in the payload
+  - wavelength code and detector id included in the payload
   - raw capture stored in `all_groups.csv`
 
-- **Single-channel processing**
+- **Dual-detector five-wavelength processing**
   - threshold filtering
   - low-pass filtering
-  - segment RMS by wavelength code
-  - 660/940 pairing
-  - MBLL + CBSI
+  - segment RMS by detector/wavelength code
+  - 2 detector x 5 wavelength cycle aggregation
+  - generalized MBLL for HbO / HbR / Cyt
 
 - **Visualization**
-  - `adc_live.py`: live ADC plot for 660nm / 940nm
+  - `adc_live.py`: live ADC plot for all detector/wavelength combinations
+  - `hbo_hbr_live.py`: live HbO / HbR / Cyt plot
   - `adc_animation.py`: replay raw CSV
   - `mBLL_animation.py`: replay processed CSV
   - `visualizer.py`: lightweight control dashboard
@@ -60,21 +61,13 @@ It targets the new **26-byte framed serial protocol** and assumes one physical c
 
 | Byte | Meaning |
 |------|---------|
-| 0 | wavelength code (`0x00=off`, `0x01=940nm`, `0x02=660nm`) |
-| 1 | sensor id (`0x00` for current S1_D1 deployment) |
-| 2 | sampled value low byte |
-| 3 | sampled value high byte |
-| 4-19 | reserved |
+| 0 | wavelength code (`0x00=off`, `0x01=850nm`, `0x02=810nm`, `0x03=770nm`, `0x04=730nm`, `0x05=700nm`) |
+| 1 | detector id (`0x01=PD1/S1_D1`, `0x02=PD2/S1_D2`) |
+| 2-5 | sampled value, unsigned 32-bit big-endian |
+| 6-19 | reserved |
 | 20 | reserved, currently fixed `0x00` |
 
-Here, the payload byte `0` wavelength code is also the effective
-"emitter-state" meaning for the host side:
-
-- `0x00` means neither LED wavelength is active for this sample (`off`)
-- `0x01` means the current sample belongs to `940nm`
-- `0x02` means the current sample belongs to `660nm`
-
-`fNIRS_processing.py` drops `0x00` rows before 660/940 pairing. Other tools may still display off samples (e.g. live ADC).
+`fNIRS_processing.py` drops `0x00` wavelength rows before cycle aggregation. The expected cycle is five wavelengths, each followed by PD1 and PD2 samples.
 
 ### ACK Handling
 
@@ -89,17 +82,19 @@ Edit `config.py` before running:
 - `BAUD_RATE`
 - `TIMEOUT`
 - `DEFAULT_INTENSITY_MA`
-- `SOURCE_DETECTOR_DISTANCE_CM`
+- `DETECTOR_CHANNELS`
+- `WAVELENGTH_CHANNELS`
+- `CYT_DIFFERENCE_EXTINCTION`
 
 ## Main Scripts
 
 ### `fNIRS_processing.py`
 
-Captures raw frames, acknowledges incoming data frames, writes `all_groups.csv`, creates `interleaved_output.csv`, and computes `processed_output.csv`.
+Captures raw frames, writes `all_groups.csv`, creates the 2x5 wavelength `interleaved_output.csv`, and computes HbO/HbR/Cyt in `processed_output.csv`.
 
 ### `adc_live.py`
 
-Starts the stream and displays 660nm / 940nm values live on one plot.
+Starts the stream and displays all detector/wavelength values live on one plot.
 
 ### `visualizer.py`
 
@@ -121,17 +116,19 @@ python visualizer.py demo
 ### `all_groups.csv`
 
 ```text
-Time (s),SensorId,S1_D1,Wavelength
+Time (s),DetectorId,Channel,Wavelength,Value
 ```
 
 ### `interleaved_output.csv`
 
 ```text
-Time (s),S1_D1_660,S1_D1_940
+Time (s),S1_D1_850,S1_D1_810,S1_D1_770,S1_D1_730,S1_D1_700,S1_D2_850,...
 ```
 
 ### `processed_output.csv`
 
 ```text
-Time,S1_D1_hbo,S1_D1_hbr
+Time,S1_D1_hbo,S1_D1_hbr,S1_D1_cyt,S1_D2_hbo,S1_D2_hbr,S1_D2_cyt
 ```
+
+`cyt` uses the UCL-NIR-Spectra cytochrome oxidase difference extinction spectrum (`OD / cm / mM`), converted internally to `OD / cm / M` to match HbO/HbR. Experimental calibration is still recommended before interpreting it as a validated absolute concentration.

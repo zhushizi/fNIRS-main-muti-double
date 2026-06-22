@@ -1,12 +1,12 @@
 """
-单通道 fNIRS 采集与处理主脚本。
+双接收源五波长 fNIRS 采集与处理主脚本。
 
 完整链路如下：
-1. 通过 26B 协议采集原始单通道数据
+1. 通过 26B 协议采集 S1-D1 / S1-D2 五波长原始数据
 2. 写入 all_groups.csv
-3. 对单通道信号做阈值/低通/RMS 预处理
-4. 按 config.WAVELENGTH_CHANNELS 聚合成多列光强
-5. 计算 OD -> MBLL -> CBSI
+3. 对每个接收源/波长组合做阈值/低通/RMS 预处理
+4. 聚合成 2 接收源 x 5 波长光强宽表
+5. 计算 OD -> 广义 MBLL -> HbO/HbR/Cyt
 6. 输出 processed_output.csv
 """
 
@@ -19,7 +19,6 @@ import time
 from datetime import datetime
 
 import nirsimple.preprocessing as nsp
-import nirsimple.processing as nproc
 import numpy as np
 import pandas as pd
 import serial
@@ -33,18 +32,22 @@ from config import (
     BP_LOW_HZ,
     BP_ORDER,
     BP_TARGET_FS_HZ,
-    CHANNEL_NAME,
+    CHROMOPHORE_TYPES,
+    CYT_DIFFERENCE_EXTINCTION,
+    DETECTOR_CHANNELS,
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
     INTENSITY_COLUMNS,
+    MAX_RETRIES,
     MBLL_DEFAULT_AGE,
     RAW_OUTPUT_CSV,
     SERIAL_PORT,
-    SOURCE_DETECTOR_DISTANCE_CM,
     TIMEOUT,
     WAVELENGTH_CHANNELS,
     WAVELENGTH_OFF_CODE,
-    mbll_wavelengths_nm,
+    detector_channel_by_code,
+    intensity_column_for,
+    intensity_columns_for_detector,
     wavelength_channel_by_code,
 )
 from protocol import (
@@ -58,6 +61,11 @@ from protocol import (
 def open_serial() -> serial.Serial:
     """按配置打开串口。"""
     return serial.Serial(SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
+
+
+def frame_to_hex(frame_bytes: bytes) -> str:
+    """把协议帧转成十六进制字符串，便于现场联调。"""
+    return " ".join(f"{b:02X}" for b in frame_bytes)
 
 
 def _start_enter_listener(stop_event: threading.Event) -> threading.Thread:
@@ -74,14 +82,45 @@ def _start_enter_listener(stop_event: threading.Event) -> threading.Thread:
     return thread
 
 
+def start_stream_until_data(
+    ser: serial.Serial,
+    reader: FrameReader,
+    intensity_ma: int,
+) -> object | None:
+    """
+    发送启动命令并等待第一帧数据。
+
+    有些固件版本对单次启动命令不敏感；这里复用实时 ADC 脚本的策略：
+    最多发送 MAX_RETRIES + 1 次，收到第一帧 0x02 即认为启动成功。
+    """
+    command = build_command_frame(DEFAULT_STREAM_ENABLED, intensity_ma)
+    startup_timeout = max(ACK_TIMEOUT_SECONDS * 10, 0.2)
+
+    for attempt in range(MAX_RETRIES + 1):
+        print(f"TX start command attempt {attempt + 1}: {frame_to_hex(command)}")
+        ser.write(command)
+        deadline = time.time() + startup_timeout
+        while time.time() < deadline:
+            frame = reader.read_frame(timeout_seconds=min(TIMEOUT, max(0.01, deadline - time.time())))
+            if frame is None:
+                continue
+            if frame.frame_type == 0x02:
+                print("Stream became active; first data frame received.")
+                return frame
+            print(f"Ignored startup frame type: 0x{frame.frame_type:02X}")
+
+    print("No data frame received during startup; keep waiting in capture loop.")
+    return None
+
+
 def threshold_filter(
     df: pd.DataFrame,
-    signal_col: str = CHANNEL_NAME,
+    signal_col: str = "Value",
     lower_threshold: int = 50000,
     upper_threshold: int = 300000,
     zero_level: int = 170000,
 ) -> pd.DataFrame:
-    """对单通道数值做阈值抑制，超限值直接替换为 zero_level。"""
+    """对采样值做阈值抑制，超限值直接替换为 zero_level。"""
     filtered = df.copy()
     filtered[signal_col] = np.where(
         (df[signal_col] < lower_threshold) | (df[signal_col] > upper_threshold),
@@ -96,9 +135,9 @@ def butter_lowpass_filter(
     cutoff_hz: float,
     fs: float,
     order: int = 4,
-    signal_col: str = CHANNEL_NAME,
+    signal_col: str = "Value",
 ) -> pd.DataFrame:
-    """对单通道沿时间轴做低通滤波。"""
+    """按接收源/波长组合分别低通，避免不同 LED/PD 的电平互相污染。"""
     if len(df) < max(12, order * 3):
         return df.copy()
 
@@ -108,21 +147,32 @@ def butter_lowpass_filter(
         return filtered
 
     b, a = butter(order, cutoff_hz / nyquist, btype="low", analog=False)
-    padlen = min(len(df) - 1, 3 * (max(len(a), len(b)) - 1)) # 计算滤波器长度
-    if padlen <= 0:
-        return filtered
-    filtered[signal_col] = filtfilt(b, a, df[signal_col], padlen=padlen)
+    group_cols = [col for col in ("DetectorId", "Wavelength") if col in filtered.columns]
+    grouped = filtered.groupby(group_cols, sort=False) if group_cols else [(None, filtered)]
+    for _, group in grouped:
+        if len(group) < max(12, order * 3):
+            continue
+        padlen = min(len(group) - 1, 3 * (max(len(a), len(b)) - 1))
+        if padlen <= 0:
+            continue
+        filtered.loc[group.index, signal_col] = filtfilt(
+            b,
+            a,
+            group[signal_col].astype(float),
+            padlen=padlen,
+        )
     return filtered
 
 
 def sliding_window_rms(
     df: pd.DataFrame,
-    signal_col: str = CHANNEL_NAME,
+    signal_col: str = "Value",
     wavelength_col: str = "Wavelength",
+    detector_col: str = "DetectorId",
     remove_dc: bool = False,
 ) -> pd.DataFrame:
     """
-    按波长切段，并把每一段压成一行 RMS 代表值。
+    按 (DetectorId, Wavelength) 连续段切段，并把每一段压成一行 RMS 代表值。
 
     这样后续在做双波长配对时，每个波长块只保留一个物理有效样本，
     避免把同一块里的重复 RMS 再展开成多行。
@@ -130,9 +180,9 @@ def sliding_window_rms(
     if df.empty:
         return df.copy()
 
-    wavelength_reference = df[wavelength_col].values # 波长编号序列
-    change_points = np.where(np.diff(wavelength_reference) != 0)[0] + 1 # 找到波长变化点
-    segments = np.split(np.arange(len(df)), change_points) # 按波长变化点分割数据
+    keys = df[[detector_col, wavelength_col]].astype(int).to_numpy()
+    change_points = np.where(np.any(np.diff(keys, axis=0) != 0, axis=1))[0] + 1
+    segments = np.split(np.arange(len(df)), change_points)
     rows = [] # 存储每一段数据的 RMS 代表值
 
     for segment in segments:
@@ -154,45 +204,52 @@ def sliding_window_rms(
 
 def aggregate_wavelength_cycles(
     df: pd.DataFrame,
-    signal_col: str = CHANNEL_NAME,
+    signal_col: str = "Value",
     mode_col: str = "Wavelength",
 ) -> pd.DataFrame:
     """
-    将 RMS 后的多波长段合并为一行：每种活跃波长一列（列名见 config）。
+    将 RMS 后的 2 接收源 x 5 波长段合并为一行。
 
-    在时序上每凑齐 WAVELENGTH_CHANNELS 中的全部协议码即输出一行；
-    与具体交错顺序无关，便于扩展到 3 路及以上波长。
+    在时序上每凑齐 DETECTOR_CHANNELS x WAVELENGTH_CHANNELS 即输出一行；
+    与具体交错顺序弱相关，仍以 payload 中的 DetectorId/Wavelength 为准。
     """
-    n_wl = len(WAVELENGTH_CHANNELS)
-    required_codes = {ch.code for ch in WAVELENGTH_CHANNELS}
-    pending: dict[int, pd.Series] = {}
+    required_keys = {(det.code, wl.code) for det in DETECTOR_CHANNELS for wl in WAVELENGTH_CHANNELS}
+    pending: dict[tuple[int, int], pd.Series] = {}
     rows: list[dict[str, float]] = []
 
     def flush_pending() -> None:
-        if set(pending.keys()) != required_codes:
+        if set(pending.keys()) != required_keys:
             return
-        times = [float(pending[ch.code]["Time (s)"]) for ch in WAVELENGTH_CHANNELS]
+        times = [float(row["Time (s)"]) for row in pending.values()]
         out: dict[str, float] = {"Time (s)": float(np.mean(times))}
-        for ch in WAVELENGTH_CHANNELS:
-            out[ch.intensity_column] = float(pending[ch.code][signal_col])
+        for det in DETECTOR_CHANNELS:
+            for wl in WAVELENGTH_CHANNELS:
+                out[intensity_column_for(det.name, wl.emitter_nm)] = float(
+                    pending[(det.code, wl.code)][signal_col]
+                )
         rows.append(out)
         pending.clear()
 
     for _, row in df.reset_index(drop=True).iterrows():
         code = int(row[mode_col])
-        if wavelength_channel_by_code(code) is None:
+        detector_code = int(row["DetectorId"])
+        if wavelength_channel_by_code(code) is None or detector_channel_by_code(detector_code) is None:
             continue
-        pending[code] = row
-        if len(pending) == n_wl:
+        key = (detector_code, code)
+        if key in pending:
+            # 周期未凑齐却遇到同一 detector/wavelength，说明中间缺帧；重启当前周期。
+            pending.clear()
+        pending[key] = row
+        if len(pending) == len(required_keys):
             flush_pending()
 
     return pd.DataFrame(rows)
 
 
-def stack_intensities_for_mbll(df: pd.DataFrame) -> np.ndarray:
+def stack_intensities_for_detector(df: pd.DataFrame, detector) -> np.ndarray:
     """按 WAVELENGTH_CHANNELS 顺序堆叠为 (n_wavelengths, n_timepoints)。"""
     return np.vstack(
-        [df[ch.intensity_column].to_numpy(dtype=float) for ch in WAVELENGTH_CHANNELS]
+        [df[col].to_numpy(dtype=float) for col in intensity_columns_for_detector(detector)]
     )
 
 
@@ -242,29 +299,57 @@ def smart_bandpass(
     return data_bp
 
 
-def build_channel_info(
-    age: int = MBLL_DEFAULT_AGE,
-    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
-):
-    """构造单通道 MBLL 所需的通道名、波长、DPF 与源探距离。"""
-    ch_wls = mbll_wavelengths_nm()
-    channel_names = [CHANNEL_NAME] * len(ch_wls)
-    ch_dpfs = [nsp.get_dpf(wl, age) for wl in ch_wls]
-    ch_distances = [source_detector_distance_cm] * len(ch_wls)
-    return channel_names, ch_wls, ch_dpfs, ch_distances
+def _hemoglobin_extinctions(wavelengths: list[float], table: str = "wray") -> np.ndarray:
+    """读取 nirsimple 内置 HbO/HbR 消光系数表，并插值到五个波长。"""
+    ex_path = os.path.join(os.path.dirname(nsp.__file__), "tables", f"{table}.csv")
+    ex_df = pd.read_csv(ex_path)
+    table_wls = ex_df["lambda"].to_numpy(dtype=float)
+    hbo = ex_df["hbo"].to_numpy(dtype=float)
+    hbr = ex_df["hbr"].to_numpy(dtype=float)
+    return np.column_stack(
+        [
+            np.interp(wavelengths, table_wls, hbo),
+            np.interp(wavelengths, table_wls, hbr),
+        ]
+    )
+
+
+def _extinction_matrix(wavelengths: list[float], table: str = "wray") -> np.ndarray:
+    """
+    构造 HbO/HbR/Cyt 三色团消光系数矩阵。
+
+    Cyt 使用 UCL-NIR-Spectra 的 cytochrome oxidase difference extinction
+    spectrum，原始单位 OD / cm / mM；这里转为 OD / cm / M，与 HbO/HbR 一致。
+    """
+    hb_ex = _hemoglobin_extinctions(wavelengths, table)
+    cyt = np.asarray([CYT_DIFFERENCE_EXTINCTION[float(wl)] for wl in wavelengths], dtype=float) * 1000.0
+    return np.column_stack([hb_ex, cyt])
+
+
+def generalized_mbll(
+    delta_od: np.ndarray,
+    wavelengths: list[float],
+    dpfs: list[float],
+    distance_cm: float,
+    table: str = "wray",
+) -> np.ndarray:
+    """用五波长最小二乘反演 HbO/HbR/Cyt，返回 (3, n_timepoints)。"""
+    ex = _extinction_matrix(wavelengths, table)
+    pathlength = np.asarray(dpfs, dtype=float) * float(distance_cm)
+    a_matrix = ex * pathlength[:, np.newaxis]
+    return np.linalg.pinv(a_matrix) @ delta_od
 
 
 def process_csv_dataset(
     input_csv: str,
     output_csv: str,
     age: int = MBLL_DEFAULT_AGE,
-    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
     molar_ext_coeff_table: str = "wray",
     bp_low: float = BP_LOW_HZ,
     bp_high: float = BP_HIGH_HZ,
     bp_order: int = BP_ORDER,
 ) -> None:
-    """从配对后的 CSV 计算最终的 HbO/HbR。"""
+    """从聚合后的 CSV 计算最终的 HbO/HbR/Cyt。"""
     df = pd.read_csv(input_csv)
     required_cols = ["Time (s)", *INTENSITY_COLUMNS]
     if df.empty or any(col not in df.columns for col in required_cols):
@@ -276,47 +361,43 @@ def process_csv_dataset(
         print("Need at least two time samples to run MBLL.")
         return
 
-    samples = stack_intensities_for_mbll(df)
-
-    channel_names, ch_wls, ch_dpfs, ch_distances = build_channel_info(age, source_detector_distance_cm)
-    # 先把光强转成 OD，再做带通和 MBLL。
-    delta_od = nsp.intensities_to_od_changes(samples)
-
     dt = np.mean(np.diff(times))
     fs = 1.0 / dt if dt > 0 else 1.0
-    # 带通滤波
-    delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
 
-    # MBLL 计算
-    delta_c, new_ch_names, new_ch_types = nsp.mbll(
-        delta_od_filt,
-        channel_names,
-        ch_wls,
-        ch_dpfs,
-        ch_distances,
-        unit="cm",
-        table=molar_ext_coeff_table,
-    )
-    # CBSI 用于进一步抑制生理伪差，改善 HbO/HbR 的相关性。
-    delta_c_corr, corr_ch_names, corr_ch_types = nproc.cbsi(delta_c, new_ch_names, new_ch_types)
+    wavelengths = [ch.mbll_nm for ch in WAVELENGTH_CHANNELS]
+    dpfs = [nsp.get_dpf(wl, age) for wl in wavelengths]
+    outputs: list[np.ndarray] = []
+    processed_headers: list[str] = []
+    table_data = []
 
-    # 写入文件
-    processed_headers = [f"{name}_{ctype}" for name, ctype in zip(corr_ch_names, corr_ch_types)]
+    for detector in DETECTOR_CHANNELS:
+        samples = stack_intensities_for_detector(df, detector)
+        delta_od = nsp.intensities_to_od_changes(samples)
+        delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
+        delta_c = generalized_mbll(
+            delta_od_filt,
+            wavelengths,
+            dpfs,
+            detector.distance_cm,
+            table=molar_ext_coeff_table,
+        )
+        outputs.append(delta_c)
+        for chrom_idx, chrom_type in enumerate(CHROMOPHORE_TYPES):
+            processed_headers.append(f"{detector.name}_{chrom_type}")
+            table_data.append([detector.name, chrom_type, f"{delta_c[chrom_idx, -1]:.4e}"])
+
+    delta_c_all = np.vstack(outputs)
     header_out = ["Time"] + processed_headers
 
     with open(output_csv, "w", newline="", encoding="utf-8") as f_out:
         writer = csv.writer(f_out)
         writer.writerow(header_out)
-        n_cols = min(len(times), delta_c_corr.shape[1])
+        n_cols = min(len(times), delta_c_all.shape[1])
         for col_idx in range(n_cols):
-            writer.writerow([times[col_idx]] + list(delta_c_corr[:, col_idx]))
+            writer.writerow([times[col_idx]] + list(delta_c_all[:, col_idx]))
 
-    last_sample = delta_c_corr[:, -1]
-    table_data = []
-    for idx, ch in enumerate(corr_ch_names):
-        table_data.append([ch, corr_ch_types[idx], f"{last_sample[idx]:.4e}"])
     print(f"Post-processing complete. Output saved to '{output_csv}'.")
-    print("\nExample: Processed concentrations at the final time sample:")
+    print("\nExample: Processed concentrations at the final time sample (Cyt uses UCL extinction):")
     print(tabulate(table_data, headers=["Channel", "Type", "Concentration"]))
 
 
@@ -327,7 +408,7 @@ def capture_data(
     intensity_ma: int = DEFAULT_INTENSITY_MA,
 ) -> None:
     """
-    采集单通道原始数据并写 CSV。
+    采集双接收源五波长原始数据并写 CSV。
 
     每收到一帧 0x02 数据帧就：
     1. 回 ACK
@@ -341,23 +422,17 @@ def capture_data(
 
     try:
         ser.reset_input_buffer() # 清空串口接收缓冲区里的残留数据
-        started = send_frame_with_ack( # 发送启动命令
-            ser,
-            reader,
-            build_command_frame(DEFAULT_STREAM_ENABLED, intensity_ma),
-        )
-        if not started:
-            raise RuntimeError(
-                f"Failed to start stream: no ACK within {ACK_TIMEOUT_SECONDS * 1000:.0f} ms."
-            )
+        first_frame = start_stream_until_data(ser, reader, intensity_ma)
 
         with open(csv_filename, mode="w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
-            # 单通道原始采样表：时间 + 传感器号 + 数值 + 波长编号
-            writer.writerow(["Time (s)", "SensorId", CHANNEL_NAME, "Wavelength"])
+            # 原始采样窄表：时间 + 接收源号 + 通道名 + 波长编号 + 数值
+            writer.writerow(["Time (s)", "DetectorId", "Channel", "Wavelength", "Value"])
 
-            print("Starting single-channel raw ADC logging (seconds elapsed)...")
+            print("Starting dual-detector five-wavelength raw ADC logging (seconds elapsed)...")
             start_time = time.time()
+            last_wait_log = start_time
+            rows_written = 0
 
             while True:
                 if stop_event.is_set():
@@ -367,10 +442,22 @@ def capture_data(
                     print("Capture duration reached.")
                     break
 
-                frame = reader.read_frame(timeout_seconds=TIMEOUT)
+                if first_frame is not None:
+                    frame = first_frame
+                    first_frame = None
+                else:
+                    frame = reader.read_frame(timeout_seconds=TIMEOUT)
                 if frame is None:
+                    now = time.time()
+                    if now - last_wait_log >= 1.0:
+                        print(
+                            f"Waiting for data frames... elapsed={now - start_time:.1f}s "
+                            f"rows={rows_written}"
+                        )
+                        last_wait_log = now
                     continue
                 if frame.frame_type != 0x02:
+                    print(f"Ignored frame type: 0x{frame.frame_type:02X}")
                     continue
 
                 sample = parse_data_frame(frame)
@@ -378,19 +465,24 @@ def capture_data(
                 writer.writerow(
                     [
                         elapsed_time,
-                        sample.sensor_id,
-                        sample.value,
+                        sample.detector_code,
+                        sample.channel_name or "",
                         sample.wavelength_code,
+                        sample.value,
                     ]
                 )
+                rows_written += 1
                 csvfile.flush()
                 print(
                     f"{elapsed_time:.3f}s - value={sample.value} "
-                    f"wl={int(sample.wavelength_code)} sensor={int(sample.sensor_id)}"
+                    f"wl={int(sample.wavelength_code)} detector={int(sample.detector_code)} "
+                    f"channel={sample.channel_name or 'unknown'}"
                 )
     finally:
         try:
-            send_frame_with_ack(ser, reader, build_command_frame(False, intensity_ma))
+            stop_command = build_command_frame(False, intensity_ma)
+            print(f"TX stop command: {frame_to_hex(stop_command)}")
+            send_frame_with_ack(ser, reader, stop_command)
         except Exception:
             pass
         ser.close()
@@ -468,7 +560,7 @@ def run_pipeline() -> None:
     final_df.to_csv(interleaved_path, index=False)
     print(final_df.head(20))
 
-    # 计算最终的 HbO/HbR
+    # 计算最终的 HbO/HbR/Cyt
     process_csv_dataset(interleaved_path, processed_path)
 
 

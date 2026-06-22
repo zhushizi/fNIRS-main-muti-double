@@ -1,5 +1,5 @@
 """
-单通道 26B 协议的公共辅助模块。
+双接收源五波长 26B 协议的公共辅助模块。
 
 这个文件负责两类事情：
 1. 组帧：把命令/ACK 拼成完整 26B 帧
@@ -18,6 +18,8 @@ import serial
 
 from config import (
     ACK_TIMEOUT_SECONDS,
+    DETECTOR_BY_CODE,
+    DEFAULT_COMMAND_CHANNEL_CODE,
     DEFAULT_INTENSITY_MA,
     FRAME_HEADER,
     FRAME_LENGTH,
@@ -44,6 +46,8 @@ class DataSample:
     wavelength_code: int
     wavelength_nm: Optional[float]
     sensor_id: int
+    detector_code: int
+    channel_name: Optional[str]
     value: int
 
 
@@ -63,11 +67,12 @@ def build_frame(frame_type: int, payload: bytes) -> bytes:
 
 
 def build_command_frame(stream_enabled: bool, intensity_ma: int = DEFAULT_INTENSITY_MA) -> bytes:
-    """构造 0x01 命令帧。当前使用 payload[0]=启停, payload[1]=单字节光强。"""
+    """构造 0x01 命令帧：payload[0]=启停, payload[1]=光强, payload[2]=通道选择。"""
     intensity = max(0, min(intensity_ma, 0xFF))
     payload = bytearray(FRAME_PAYLOAD_SIZE)
     payload[0] = 0x01 if stream_enabled else 0x00
     payload[1] = intensity
+    payload[2] = DEFAULT_COMMAND_CHANNEL_CODE
     return build_frame(FRAME_TYPE_COMMAND, bytes(payload))
 
 
@@ -80,30 +85,31 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
     """
     解析 0x02 数据帧。
 
-    当前协议约定（payload byte0）：
-    - 0x00：未点亮
-    - 0x01：940nm
-    - 0x02：660nm
-
-    其余字段：
-    - payload[1] = 传感器编号
+    当前协议约定：
+    - payload[0] = 光源波长编号（0x01..0x05）
+    - payload[1] = 接收源编号（PD1=0x01，PD2=0x02）
     - payload[2:6] = 采样值（高字节在前，4 字节）
+
+    sensor_id 字段保留为 detector_code 的兼容别名。
     """
     if frame.frame_type != FRAME_TYPE_DATA:
         raise ValueError("Expected a data frame.")
 
     payload = frame.payload
     wavelength_code = payload[0]
-    sensor_id = payload[1]
+    detector_code = payload[1]
     value = int.from_bytes(payload[2:6], byteorder="big", signed=False)
     if wavelength_code == WAVELENGTH_OFF_CODE:
         wavelength_nm: Optional[float] = None
     else:
         wavelength_nm = WAVELENGTH_BY_CODE.get(wavelength_code)
+    channel_name = DETECTOR_BY_CODE.get(detector_code)
     return DataSample(
         wavelength_code=wavelength_code,
         wavelength_nm=wavelength_nm,
-        sensor_id=sensor_id,
+        sensor_id=detector_code,
+        detector_code=detector_code,
+        channel_name=channel_name,
         value=value,
     )
 

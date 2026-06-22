@@ -1,10 +1,10 @@
 """
-单通道实时 ADC 曲线查看器。
+双接收源五波长实时 ADC 曲线查看器。
 
 这个脚本的职责很单纯：
 1. 给下位机发启动命令
 2. 持续读取 0x02 数据帧
-3. 把 660nm / 940nm 分成两条曲线显示（时域 + 频域 FFT 幅度谱）
+3. 把 S1-D1 / S1-D2 的五个波长分成多条曲线显示（时域 + 频域 FFT 幅度谱）
 """
 
 from __future__ import annotations
@@ -22,12 +22,12 @@ from scipy.signal import butter, lfilter, sosfilt
 from config import (
     ACK_TIMEOUT_SECONDS,
     BAUD_RATE,
+    DETECTOR_CHANNELS,
     DEFAULT_INTENSITY_MA,
     MAX_RETRIES,
     SERIAL_PORT,
     TIMEOUT,
-    WAVELENGTH_660_CODE,
-    WAVELENGTH_940_CODE,
+    WAVELENGTH_CHANNELS,
     WAVELENGTH_OFF_CODE,
 )
 from protocol import FrameReader, build_command_frame, parse_data_frame, send_frame_with_ack
@@ -45,7 +45,7 @@ def frame_to_hex(frame_bytes: bytes) -> str:
 
 class SerialReaderThread(QtCore.QThread):
     """后台串口读取线程，避免 GUI 主线程被串口阻塞。"""
-    newData = QtCore.pyqtSignal(float, int, int)
+    newData = QtCore.pyqtSignal(float, int, int, int, str)
 
     def __init__(self, ser: serial.Serial, parent=None):
         super().__init__(parent)
@@ -59,11 +59,18 @@ class SerialReaderThread(QtCore.QThread):
         elapsed = time.time() - self.start_time
         print(
             "[adc_live] Data frame received:",
-            f"sensor={sample.sensor_id}",
+            f"detector={sample.detector_code}",
+            f"channel={sample.channel_name}",
             f"wavelength_code=0x{sample.wavelength_code:02X}",
             f"value={sample.value}",
         )
-        self.newData.emit(elapsed, sample.wavelength_code, sample.value)
+        self.newData.emit(
+            elapsed,
+            sample.detector_code,
+            sample.wavelength_code,
+            sample.value,
+            sample.channel_name or "",
+        )
 
     def _start_stream(self) -> bool:
         """
@@ -129,25 +136,33 @@ class SerialReaderThread(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QWidget):
-    """简单的双曲线窗口：红色 660nm，绿色 940nm。"""
+    """显示 2 接收源 x 5 波长的实时 ADC 曲线。"""
     def __init__(self):
         super().__init__()
         pg.setConfigOption("background", "w")
         pg.setConfigOption("foreground", "k")
-        self.setWindowTitle("单通道 ADC 实时监视")
+        self.setWindowTitle("双接收源五波长 ADC 实时监视")
 
         # 固定只显示最近 10 秒。
         self.window_seconds = 10.0
         self.max_points = 3000
-        self.data_660 = deque(maxlen=self.max_points)
-        self.data_940 = deque(maxlen=self.max_points)
-        self.time_660 = deque(maxlen=self.max_points)
-        self.time_940 = deque(maxlen=self.max_points)
+        self.series: dict[tuple[int, int], dict] = {}
 
         main_layout = QtWidgets.QVBoxLayout(self)
         top_layout = QtWidgets.QHBoxLayout()
         top_layout.addStretch()
-        for color, label in (("red", "660nm"), ("green", "940nm")):
+        colors = ["red", "green", "blue", "magenta", "cyan", "darkRed", "darkGreen", "darkBlue", "gray", "black"]
+        for idx, (detector, wavelength) in enumerate(
+            (det, wl) for det in DETECTOR_CHANNELS for wl in WAVELENGTH_CHANNELS
+        ):
+            color = colors[idx % len(colors)]
+            label = f"{detector.name} {int(wavelength.emitter_nm)}nm"
+            self.series[(detector.code, wavelength.code)] = {
+                "time": deque(maxlen=self.max_points),
+                "data": deque(maxlen=self.max_points),
+                "label": label,
+                "color": color,
+            }
             item = QtWidgets.QWidget()
             item_layout = QtWidgets.QHBoxLayout(item)
             item_layout.setContentsMargins(0, 0, 0, 0)
@@ -224,14 +239,17 @@ class MainWindow(QtWidgets.QWidget):
 
         main_layout.addLayout(filter_layout)
 
-        self.plot_widget = pg.PlotWidget(title="S1_D1 ADC 实时波形")
+        self.plot_widget = pg.PlotWidget(title="S1-D1 / S1-D2 ADC 实时波形")
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.setLabel("bottom", "时间 (s)")
         self.plot_widget.setLabel("left", "ADC 数值")
         self.plot_widget.addLegend()
         self.plot_widget.setXRange(0, self.window_seconds, padding=0)
-        self.curve_660 = self.plot_widget.plot(pen=pg.mkPen("r", width=2), name="660nm")
-        self.curve_940 = self.plot_widget.plot(pen=pg.mkPen("g", width=2), name="940nm")
+        for series in self.series.values():
+            series["curve"] = self.plot_widget.plot(
+                pen=pg.mkPen(series["color"], width=2),
+                name=series["label"],
+            )
         main_layout.addWidget(self.plot_widget)
 
         # 频域：对当前时间窗内的序列做 rFFT（按各自时间戳估计采样率）
@@ -241,12 +259,11 @@ class MainWindow(QtWidgets.QWidget):
         self.spectrum_widget.setLabel("bottom", "频率 (Hz)")
         self.spectrum_widget.setLabel("left", "幅值")
         self.spectrum_widget.addLegend()
-        self.spectrum_curve_660 = self.spectrum_widget.plot(
-            pen=pg.mkPen("r", width=2), name="660nm"
-        )
-        self.spectrum_curve_940 = self.spectrum_widget.plot(
-            pen=pg.mkPen("g", width=2), name="940nm"
-        )
+        for series in self.series.values():
+            series["spectrum_curve"] = self.spectrum_widget.plot(
+                pen=pg.mkPen(series["color"], width=2),
+                name=series["label"],
+            )
         main_layout.addWidget(self.spectrum_widget)
 
         self.status_label = QtWidgets.QLabel("等待数据...")
@@ -353,62 +370,45 @@ class MainWindow(QtWidgets.QWidget):
             print(f"[adc_live] Filter failed ({mode}): {exc}")
         return y
 
-    @QtCore.pyqtSlot(float, int, int)
-    def on_new_data(self, elapsed: float, wavelength_code: int, value: int):
-        """按波长把点分发到两条曲线各自的缓存里。"""
-        if wavelength_code == WAVELENGTH_660_CODE:
-            self.time_660.append(elapsed)
-            self.data_660.append(value)
-            wave_label = "660nm"
-        elif wavelength_code == WAVELENGTH_940_CODE:
-            self.time_940.append(elapsed)
-            self.data_940.append(value)
-            wave_label = "940nm"
-        elif wavelength_code == WAVELENGTH_OFF_CODE:
+    @QtCore.pyqtSlot(float, int, int, int, str)
+    def on_new_data(self, elapsed: float, detector_code: int, wavelength_code: int, value: int, channel_name: str):
+        """按接收源和波长把点分发到各自的缓存里。"""
+        if wavelength_code == WAVELENGTH_OFF_CODE:
             wave_label = "OFF"
-        else:
-            wave_label = f"Unknown(0x{wavelength_code:02X})"
-            print(f"[adc_live] Unknown wavelength code: 0x{wavelength_code:02X}")
+            self.status_label.setText(f"最新数据：{wave_label} 数值={value}")
+            return
 
+        key = (detector_code, wavelength_code)
+        if key not in self.series:
+            print(f"[adc_live] Unknown detector/wavelength: detector=0x{detector_code:02X}, wl=0x{wavelength_code:02X}")
+            return
+
+        self.series[key]["time"].append(elapsed)
+        self.series[key]["data"].append(value)
+        wave_label = self.series[key]["label"]
         self.status_label.setText(f"最新数据：{wave_label} 数值={value}")
 
     def update_plots(self):
         """定时刷新曲线，并把 X 轴滚动到最近 10 秒窗口。"""
-        if self.data_660:
-            t660 = list(self.time_660)
-            y660 = self._apply_filter(t660, list(self.data_660))
-            self.curve_660.setData(t660, y660)
-        if self.data_940:
-            t940 = list(self.time_940)
-            y940 = self._apply_filter(t940, list(self.data_940))
-            self.curve_940.setData(t940, y940)
-
         latest_time = 0.0
-        if self.time_660:
-            latest_time = max(latest_time, self.time_660[-1])
-        if self.time_940:
-            latest_time = max(latest_time, self.time_940[-1])
+        for series in self.series.values():
+            if series["data"]:
+                times = list(series["time"])
+                values = self._apply_filter(times, list(series["data"]))
+                series["curve"].setData(times, values)
+                latest_time = max(latest_time, series["time"][-1])
 
         x_min = max(0.0, latest_time - self.window_seconds)
         x_max = max(self.window_seconds, latest_time)
         self.plot_widget.setXRange(x_min, x_max, padding=0)
 
-        y660_fft = self._apply_filter(list(self.time_660), list(self.data_660)) if self.data_660 else []
-        y940_fft = self._apply_filter(list(self.time_940), list(self.data_940)) if self.data_940 else []
-        f660, m660 = self._spectrum_from_timeseries(
-            self.time_660, y660_fft, self.fft_min_samples
-        )
-        f940, m940 = self._spectrum_from_timeseries(
-            self.time_940, y940_fft, self.fft_min_samples
-        )
-        if f660 is not None and m660 is not None:
-            self.spectrum_curve_660.setData(f660, m660)
-        else:
-            self.spectrum_curve_660.clear()
-        if f940 is not None and m940 is not None:
-            self.spectrum_curve_940.setData(f940, m940)
-        else:
-            self.spectrum_curve_940.clear()
+        for series in self.series.values():
+            values = self._apply_filter(list(series["time"]), list(series["data"])) if series["data"] else []
+            freqs, mags = self._spectrum_from_timeseries(series["time"], values, self.fft_min_samples)
+            if freqs is not None and mags is not None:
+                series["spectrum_curve"].setData(freqs, mags)
+            else:
+                series["spectrum_curve"].clear()
 
         mode_map = {
             "None": "不滤波",

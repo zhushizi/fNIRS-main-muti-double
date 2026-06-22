@@ -1,9 +1,8 @@
 """
-单通道实时 HbO / HbR 曲线查看器。
+双接收源五波长实时 HbO / HbR / Cyt 曲线查看器。
 
-从串口持续读取双波长光强（协议码 0x01 / 0x02），用前几秒建立基线，再对每个波长对做 OD 与 MBLL，
-将得到的 HbO、HbR 实时画在坐标图上。MBLL 波长与 data_analysis.py 一致：860 nm + 660 nm；
-OD 矩阵行顺序与 data_analysis 相同（Wavelength=1 在上，Wavelength=2 在下）。带通 0.05–0.5 Hz；不做 CBSI。
+从串口持续读取五波长光强，用前几秒为 S1-D1 / S1-D2 分别建立基线，
+再用广义 MBLL 输出 HbO、HbR 和探索版 Cyt/oxCCO 相对变化。
 """
 
 from __future__ import annotations
@@ -22,18 +21,16 @@ from scipy.signal import butter, resample_poly, sosfiltfilt
 from config import (
     ACK_TIMEOUT_SECONDS,
     BAUD_RATE,
-    CHANNEL_NAME,
+    CHROMOPHORE_TYPES,
+    DETECTOR_CHANNELS,
     DEFAULT_INTENSITY_MA,
     MAX_RETRIES,
     MBLL_DEFAULT_AGE,
-    MBLL_WAVELENGTH_WL1_NM,
-    MBLL_WAVELENGTH_WL2_NM,
     SERIAL_PORT,
-    SOURCE_DETECTOR_DISTANCE_CM,
     TIMEOUT,
-    WAVELENGTH_660_CODE,
-    WAVELENGTH_940_CODE,
+    WAVELENGTH_CHANNELS,
 )
+from fNIRS_processing import generalized_mbll
 from protocol import FrameReader, build_command_frame, parse_data_frame, send_frame_with_ack
 
 # 用前若干秒的平均光强作为 OD 基线
@@ -98,21 +95,9 @@ def open_serial() -> serial.Serial:
     return serial.Serial(SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
 
 
-def _channel_info():
-    """单通道双波长的通道名、波长、DPF、源探距离，与 data_analysis._channel_info 一致。"""
-    ch_names = [CHANNEL_NAME, CHANNEL_NAME]
-    ch_wls = [MBLL_WAVELENGTH_WL1_NM, MBLL_WAVELENGTH_WL2_NM]
-    ch_dpfs = [
-        nsp.get_dpf(MBLL_WAVELENGTH_WL1_NM, MBLL_DEFAULT_AGE),
-        nsp.get_dpf(MBLL_WAVELENGTH_WL2_NM, MBLL_DEFAULT_AGE),
-    ]
-    ch_distances = [SOURCE_DETECTOR_DISTANCE_CM, SOURCE_DETECTOR_DISTANCE_CM]
-    return ch_names, ch_wls, ch_dpfs, ch_distances
-
-
 class SerialReaderThread(QtCore.QThread):
     """后台串口读线程，与 adc_live 相同逻辑：发启动命令、持续读 0x02、回 ACK、发信号。"""
-    newData = QtCore.pyqtSignal(float, int, int)
+    newData = QtCore.pyqtSignal(float, int, int, int, str)
 
     def __init__(self, ser: serial.Serial, parent=None):
         super().__init__(parent)
@@ -123,7 +108,13 @@ class SerialReaderThread(QtCore.QThread):
 
     def _emit(self, sample):
         t = time.time() - self.start_time
-        self.newData.emit(t, sample.wavelength_code, sample.value)
+        self.newData.emit(
+            t,
+            sample.detector_code,
+            sample.wavelength_code,
+            sample.value,
+            sample.channel_name or "",
+        )
 
     def _start_stream(self) -> bool:
         cmd = build_command_frame(True, DEFAULT_INTENSITY_MA)
@@ -159,51 +150,48 @@ class SerialReaderThread(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QWidget):
-    """实时 HbO / HbR 坐标图。前几秒仅收数据建基线，之后每收到新双波长对就更新一条 MBLL 点。"""
+    """实时 HbO / HbR / Cyt 坐标图。"""
+
     def __init__(self):
         super().__init__()
         pg.setConfigOption("background", "w")
         pg.setConfigOption("foreground", "k")
-        self.setWindowTitle("S1_D1 HbO / HbR 实时")
+        self.setWindowTitle("S1-D1 / S1-D2 HbO / HbR / Cyt 实时")
 
-        self.start_time = time.time()
-        # 协议码 0x02=660 nm；0x01 在 MBLL 中按 data_analysis 使用 860 nm
-        self.ref_660: float | None = None
-        self.ref_wl1: float | None = None
-        self.baseline_660: list[float] = []
-        self.baseline_wl1: list[float] = []
+        self.required_keys = {(det.code, wl.code) for det in DETECTOR_CHANNELS for wl in WAVELENGTH_CHANNELS}
+        self.latest_values: dict[tuple[int, int], float] = {}
+        self.baseline_values: dict[tuple[int, int], list[float]] = {key: [] for key in self.required_keys}
+        self.references: dict[tuple[int, int], float] | None = None
         self.last_mbll_time = 0.0
-        self.current_phase_wl: int | None = None
-        self.current_phase_vals: list[float] = []
-        self.current_phase_times: list[float] = []
-        self.latest_rms_660: float | None = None
-        self.latest_rms_wl1: float | None = None
-        self.latest_rms_time_660: float | None = None
-        self.latest_rms_time_wl1: float | None = None
-        self.last_pair_time = -1.0
-
-        self.time_660 = deque(maxlen=5000)
-        self.data_660 = deque(maxlen=5000)
-        self.time_wl1 = deque(maxlen=5000)
-        self.data_wl1 = deque(maxlen=5000)
-
-        self.time_hbo = deque(maxlen=3000)
-        self.hbo_vals = deque(maxlen=3000)
-        self.hbr_vals = deque(maxlen=3000)
         self.time_od = deque(maxlen=3000)
-        # 行顺序与 data_analysis samples vstack 一致：wl1(0x01) 在上，660(0x02) 在下
-        self.od_wl1_vals = deque(maxlen=3000)
-        self.od_660_vals = deque(maxlen=3000)
+        self.od_history = {
+            det.code: {wl.code: deque(maxlen=3000) for wl in WAVELENGTH_CHANNELS}
+            for det in DETECTOR_CHANNELS
+        }
+
+        self.curve_data = {}
+        colors = ["red", "blue", "darkGreen", "magenta", "cyan", "black"]
 
         layout = QtWidgets.QVBoxLayout(self)
-        self.plot = pg.PlotWidget(title="HbO / HbR 实时")
+        self.plot = pg.PlotWidget(title="HbO / HbR / Cyt 实时")
         self.plot.showGrid(x=True, y=True)
         self.plot.setLabel("bottom", "Time (s)")
-        self.plot.setLabel("left", "Concentration (Δ)")
+        self.plot.setLabel("left", "Concentration (Δ, Cyt UCL extinction)")
         self.plot.addLegend()
         self.plot.setXRange(0, WINDOW_SECONDS, padding=0)
-        self.curve_hbo = self.plot.plot(pen=pg.mkPen("r", width=2), name="HbO")
-        self.curve_hbr = self.plot.plot(pen=pg.mkPen("b", width=2), name="HbR")
+        idx = 0
+        for det in DETECTOR_CHANNELS:
+            for chrom in CHROMOPHORE_TYPES:
+                key = (det.code, chrom)
+                self.curve_data[key] = {
+                    "time": deque(maxlen=3000),
+                    "value": deque(maxlen=3000),
+                    "curve": self.plot.plot(
+                        pen=pg.mkPen(colors[idx % len(colors)], width=2),
+                        name=f"{det.name}_{chrom}",
+                    ),
+                }
+                idx += 1
         layout.addWidget(self.plot)
 
         self.status = QtWidgets.QLabel("建立基线…")
@@ -213,131 +201,76 @@ class MainWindow(QtWidgets.QWidget):
         self.timer.timeout.connect(self._update_plot)
         self.timer.start(50)
 
-    @QtCore.pyqtSlot(float, int, int)
-    def on_new_data(self, elapsed: float, wavelength_code: int, value: int):
+    @QtCore.pyqtSlot(float, int, int, int, str)
+    def on_new_data(self, elapsed: float, detector_code: int, wavelength_code: int, value: int, channel_name: str):
         if value <= 0:
             return
-        if wavelength_code not in (WAVELENGTH_660_CODE, WAVELENGTH_940_CODE):
+        key = (detector_code, wavelength_code)
+        if key not in self.required_keys:
             return
 
-        # 与离线 sliding_window_rms 一致：按波长连续段切段，段结束时用 RMS 代表该段。
-        if self.current_phase_wl is None:
-            self.current_phase_wl = wavelength_code
-        elif wavelength_code != self.current_phase_wl:
-            self._finalize_phase()
-            self.current_phase_wl = wavelength_code
-            self.current_phase_vals.clear()
-            self.current_phase_times.clear()
+        value_f = float(value)
+        self.latest_values[key] = value_f
+        if self.references is None and elapsed <= BASELINE_SECONDS:
+            self.baseline_values[key].append(value_f)
 
-        self.current_phase_vals.append(float(value))
-        self.current_phase_times.append(elapsed)
+        if self.references is None and elapsed >= BASELINE_SECONDS:
+            if all(self.baseline_values[k] for k in self.required_keys):
+                self.references = {
+                    k: max(float(np.mean(v)), 1.0) for k, v in self.baseline_values.items()
+                }
+                self.status.setText("基线就绪，开始计算 HbO/HbR/Cyt")
+            else:
+                self.status.setText("基线数据不足，继续等待完整 2x5 波长周期")
+                return
 
-    def _finalize_phase(self):
-        if self.current_phase_wl is None or not self.current_phase_vals:
+        if self.references is None or set(self.latest_values.keys()) != self.required_keys:
+            return
+        if (elapsed - self.last_mbll_time) < UPDATE_INTERVAL_S:
             return
 
-        phase_rms = float(np.sqrt(np.mean(np.square(np.asarray(self.current_phase_vals, dtype=float)))))
-        phase_time = float(np.mean(self.current_phase_times))
+        self._compute_concentrations(elapsed)
 
-        if self.current_phase_wl == WAVELENGTH_660_CODE:
-            self.latest_rms_660 = phase_rms
-            self.latest_rms_time_660 = phase_time
-            self.time_660.append(phase_time)
-            self.data_660.append(phase_rms)
-            if self.ref_660 is None and phase_time <= BASELINE_SECONDS:
-                self.baseline_660.append(phase_rms)
-        elif self.current_phase_wl == WAVELENGTH_940_CODE:
-            self.latest_rms_wl1 = phase_rms
-            self.latest_rms_time_wl1 = phase_time
-            self.time_wl1.append(phase_time)
-            self.data_wl1.append(phase_rms)
-            if self.ref_wl1 is None and phase_time <= BASELINE_SECONDS:
-                self.baseline_wl1.append(phase_rms)
+    def _compute_concentrations(self, elapsed: float):
+        self.time_od.append(elapsed)
+        wavelengths = [wl.mbll_nm for wl in WAVELENGTH_CHANNELS]
+        dpfs = [nsp.get_dpf(wl, MBLL_DEFAULT_AGE) for wl in wavelengths]
 
-        # 用串口时间戳判断：满 BASELINE_SECONDS 且有两路数据则固定基线
-        if (
-            self.ref_660 is None
-            and self.ref_wl1 is None
-            and phase_time >= BASELINE_SECONDS
-            and self.baseline_660
-            and self.baseline_wl1
-        ):
-            self.ref_660 = float(np.mean(self.baseline_660))
-            self.ref_wl1 = float(np.mean(self.baseline_wl1))
-            self.status.setText(
-                f"基线就绪 ref_660={self.ref_660:.0f} "
-                f"ref_wl1({int(MBLL_WAVELENGTH_WL1_NM)}nm)={self.ref_wl1:.0f}"
-            )
+        for det in DETECTOR_CHANNELS:
+            for wl in WAVELENGTH_CHANNELS:
+                key = (det.code, wl.code)
+                intensity = max(self.latest_values[key], 1.0)
+                reference = self.references[key] if self.references is not None else intensity
+                self.od_history[det.code][wl.code].append(-np.log10(intensity / reference))
 
-        if (
-            self.ref_660 is not None
-            and self.ref_wl1 is not None
-            and self.latest_rms_660 is not None
-            and self.latest_rms_wl1 is not None
-            and self.latest_rms_time_660 is not None
-            and self.latest_rms_time_wl1 is not None
-        ):
-            t = (self.latest_rms_time_660 + self.latest_rms_time_wl1) * 0.5
-            if t <= self.last_pair_time:
-                return
-            if (t - self.last_mbll_time) < UPDATE_INTERVAL_S:
-                return
-
-            i_660 = max(self.latest_rms_660, 1.0)
-            i_wl1 = max(self.latest_rms_wl1, 1.0)
-            delta_od_660 = -np.log10(i_660 / self.ref_660)
-            delta_od_wl1 = -np.log10(i_wl1 / self.ref_wl1)
-            self.time_od.append(t)
-            self.od_wl1_vals.append(delta_od_wl1)
-            self.od_660_vals.append(delta_od_660)
-
-            delta_od_hist = np.vstack(
-                [
-                    np.asarray(self.od_wl1_vals, dtype=float),
-                    np.asarray(self.od_660_vals, dtype=float),
-                ]
+            od_matrix = np.vstack(
+                [np.asarray(self.od_history[det.code][wl.code], dtype=float) for wl in WAVELENGTH_CHANNELS]
             )
             od_times = np.asarray(self.time_od, dtype=float)
             dt = np.median(np.diff(od_times)) if od_times.size >= 2 else np.nan
             fs = 1.0 / dt if np.isfinite(dt) and dt > 0 else 1.0
-            delta_od_filt = smart_bandpass(
-                delta_od_hist,
-                fs,
-                lowcut=BP_LOW_HZ,
-                highcut=BP_HIGH_HZ,
-                order=BP_ORDER,
-            )
-            delta_od = delta_od_filt[:, -1:].astype(float, copy=False)
-            ch_names, ch_wls, ch_dpfs, ch_distances = _channel_info()
+            od_filt = smart_bandpass(od_matrix, fs, lowcut=BP_LOW_HZ, highcut=BP_HIGH_HZ, order=BP_ORDER)
             try:
-                delta_c, names, types = nsp.mbll(
-                    delta_od,
-                    ch_names,
-                    ch_wls,
-                    ch_dpfs,
-                    ch_distances,
-                    unit="cm",
-                    table="wray",
-                )
-            except Exception:
+                delta_c = generalized_mbll(od_filt[:, -1:], wavelengths, dpfs, det.distance_cm)
+            except Exception as exc:
+                self.status.setText(f"MBLL 计算失败: {exc}")
                 return
-            flat = np.ravel(delta_c)
-            if flat.size < 2:
-                return
-            hbo_val = float(flat[0])
-            hbr_val = float(flat[1])
-            self.last_mbll_time = t
-            self.last_pair_time = t
-            self.time_hbo.append(t)
-            self.hbo_vals.append(hbo_val)
-            self.hbr_vals.append(hbr_val)
-            self.status.setText(f"HbO={hbo_val:.4e}  HbR={hbr_val:.4e}  t={t:.2f}s")
+            for idx, chrom in enumerate(CHROMOPHORE_TYPES):
+                curve = self.curve_data[(det.code, chrom)]
+                curve["time"].append(elapsed)
+                curve["value"].append(float(delta_c[idx, -1]))
+
+        self.last_mbll_time = elapsed
+        self.status.setText(f"HbO/HbR/Cyt updated t={elapsed:.2f}s (Cyt UCL extinction)")
 
     def _update_plot(self):
-        if self.time_hbo:
-            self.curve_hbo.setData(list(self.time_hbo), list(self.hbo_vals))
-            self.curve_hbr.setData(list(self.time_hbo), list(self.hbr_vals))
-            t_max = max(self.time_hbo)
+        t_max = 0.0
+        for series in self.curve_data.values():
+            if not series["time"]:
+                continue
+            series["curve"].setData(list(series["time"]), list(series["value"]))
+            t_max = max(t_max, series["time"][-1])
+        if t_max > 0:
             x_min = max(0.0, t_max - WINDOW_SECONDS)
             self.plot.setXRange(x_min, max(t_max, WINDOW_SECONDS), padding=0)
 
