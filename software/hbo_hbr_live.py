@@ -3,6 +3,7 @@
 
 从串口持续读取五波长光强，用前几秒为 S1-D1 / S1-D2 分别建立基线，
 再用广义 MBLL 输出 HbO、HbR 和探索版 Cyt/oxCCO 相对变化。
+同时将短距接收源作为浅层参考，实时输出长距通道的 SSR 校正曲线。
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from config import (
     TIMEOUT,
     WAVELENGTH_CHANNELS,
 )
-from fNIRS_processing import generalized_mbll
+from fNIRS_processing import generalized_mbll, short_separation_regression
 from protocol import FrameReader, build_command_frame, parse_data_frame, send_frame_with_ack
 
 # 用前若干秒的平均光强作为 OD 基线
@@ -156,7 +157,7 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
         pg.setConfigOption("background", "w")
         pg.setConfigOption("foreground", "k")
-        self.setWindowTitle("S1-D1 / S1-D2 HbO / HbR / Cyt 实时")
+        self.setWindowTitle("S1-D1 / S1-D2 / S1-D1_ssr HbO / HbR / Cyt 实时")
 
         self.required_keys = {(det.code, wl.code) for det in DETECTOR_CHANNELS for wl in WAVELENGTH_CHANNELS}
         self.latest_values: dict[tuple[int, int], float] = {}
@@ -170,10 +171,11 @@ class MainWindow(QtWidgets.QWidget):
         }
 
         self.curve_data = {}
-        colors = ["red", "blue", "darkGreen", "magenta", "cyan", "black"]
+        self.curve_checkboxes = {}
+        colors = ["red", "blue", "darkGreen", "magenta", "cyan", "black", "darkRed", "navy", "darkMagenta"]
 
         layout = QtWidgets.QVBoxLayout(self)
-        self.plot = pg.PlotWidget(title="HbO / HbR / Cyt 实时")
+        self.plot = pg.PlotWidget(title="HbO / HbR / Cyt 实时（含短距回归校正）")
         self.plot.showGrid(x=True, y=True)
         self.plot.setLabel("bottom", "Time (s)")
         self.plot.setLabel("left", "Concentration (Δ, Cyt UCL extinction)")
@@ -183,16 +185,37 @@ class MainWindow(QtWidgets.QWidget):
         for det in DETECTOR_CHANNELS:
             for chrom in CHROMOPHORE_TYPES:
                 key = (det.code, chrom)
+                curve_name = f"{det.name}_{chrom}"
                 self.curve_data[key] = {
+                    "name": curve_name,
                     "time": deque(maxlen=3000),
                     "value": deque(maxlen=3000),
                     "curve": self.plot.plot(
                         pen=pg.mkPen(colors[idx % len(colors)], width=2),
-                        name=f"{det.name}_{chrom}",
+                        name=curve_name,
                     ),
                 }
                 idx += 1
+        if len(DETECTOR_CHANNELS) >= 2:
+            long_detector = max(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+            short_detector = min(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+            if short_detector.name != long_detector.name:
+                corrected_prefix = f"{long_detector.name}_ssr"
+                for chrom in CHROMOPHORE_TYPES:
+                    key = (corrected_prefix, chrom)
+                    curve_name = f"{corrected_prefix}_{chrom}"
+                    self.curve_data[key] = {
+                        "name": curve_name,
+                        "time": deque(maxlen=3000),
+                        "value": deque(maxlen=3000),
+                        "curve": self.plot.plot(
+                            pen=pg.mkPen(colors[idx % len(colors)], width=2, style=QtCore.Qt.DashLine),
+                            name=curve_name,
+                        ),
+                    }
+                    idx += 1
         layout.addWidget(self.plot)
+        layout.addWidget(self._build_visibility_controls())
 
         self.status = QtWidgets.QLabel("建立基线…")
         layout.addWidget(self.status)
@@ -200,6 +223,65 @@ class MainWindow(QtWidgets.QWidget):
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self._update_plot)
         self.timer.start(50)
+
+    def _build_visibility_controls(self) -> QtWidgets.QGroupBox:
+        """创建曲线显示控制区。"""
+        group = QtWidgets.QGroupBox("曲线显示")
+        outer_layout = QtWidgets.QVBoxLayout(group)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        show_all_btn = QtWidgets.QPushButton("全部显示")
+        show_all_btn.clicked.connect(lambda: self._set_all_curves_visible(True))
+        button_layout.addWidget(show_all_btn)
+
+        hide_all_btn = QtWidgets.QPushButton("全部隐藏")
+        hide_all_btn.clicked.connect(lambda: self._set_all_curves_visible(False))
+        button_layout.addWidget(hide_all_btn)
+
+        for det in DETECTOR_CHANNELS:
+            button = QtWidgets.QPushButton(f"只看 {det.name}")
+            button.clicked.connect(lambda _, det_code=det.code: self._show_only_detector(det_code))
+            button_layout.addWidget(button)
+
+        if any(isinstance(key[0], str) and key[0].endswith("_ssr") for key in self.curve_data):
+            ssr_btn = QtWidgets.QPushButton("只看 SSR")
+            ssr_btn.clicked.connect(lambda: self._show_only_suffix("_ssr"))
+            button_layout.addWidget(ssr_btn)
+
+        outer_layout.addLayout(button_layout)
+
+        checkbox_layout = QtWidgets.QGridLayout()
+        for idx, (key, series) in enumerate(self.curve_data.items()):
+            checkbox = QtWidgets.QCheckBox(series["name"])
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(lambda checked, curve_key=key: self._set_curve_visible(curve_key, checked))
+            self.curve_checkboxes[key] = checkbox
+            checkbox_layout.addWidget(checkbox, idx // 3, idx % 3)
+        outer_layout.addLayout(checkbox_layout)
+        return group
+
+    def _set_curve_visible(self, key, visible: bool) -> None:
+        series = self.curve_data.get(key)
+        if series is None:
+            return
+        series["curve"].setVisible(visible)
+        checkbox = self.curve_checkboxes.get(key)
+        if checkbox is not None and checkbox.isChecked() != visible:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(visible)
+            checkbox.blockSignals(False)
+
+    def _set_all_curves_visible(self, visible: bool) -> None:
+        for key in self.curve_data:
+            self._set_curve_visible(key, visible)
+
+    def _show_only_detector(self, detector_code: int) -> None:
+        for key in self.curve_data:
+            self._set_curve_visible(key, key[0] == detector_code)
+
+    def _show_only_suffix(self, suffix: str) -> None:
+        for key in self.curve_data:
+            self._set_curve_visible(key, isinstance(key[0], str) and key[0].endswith(suffix))
 
     @QtCore.pyqtSlot(float, int, int, int, str)
     def on_new_data(self, elapsed: float, detector_code: int, wavelength_code: int, value: int, channel_name: str):
@@ -235,6 +317,10 @@ class MainWindow(QtWidgets.QWidget):
         self.time_od.append(elapsed)
         wavelengths = [wl.mbll_nm for wl in WAVELENGTH_CHANNELS]
         dpfs = [nsp.get_dpf(wl, MBLL_DEFAULT_AGE) for wl in wavelengths]
+        detector_od: dict[int, np.ndarray] = {}
+        od_times = np.asarray(self.time_od, dtype=float)
+        dt = np.median(np.diff(od_times)) if od_times.size >= 2 else np.nan
+        fs = 1.0 / dt if np.isfinite(dt) and dt > 0 else 1.0
 
         for det in DETECTOR_CHANNELS:
             for wl in WAVELENGTH_CHANNELS:
@@ -246,9 +332,7 @@ class MainWindow(QtWidgets.QWidget):
             od_matrix = np.vstack(
                 [np.asarray(self.od_history[det.code][wl.code], dtype=float) for wl in WAVELENGTH_CHANNELS]
             )
-            od_times = np.asarray(self.time_od, dtype=float)
-            dt = np.median(np.diff(od_times)) if od_times.size >= 2 else np.nan
-            fs = 1.0 / dt if np.isfinite(dt) and dt > 0 else 1.0
+            detector_od[det.code] = od_matrix
             od_filt = smart_bandpass(od_matrix, fs, lowcut=BP_LOW_HZ, highcut=BP_HIGH_HZ, order=BP_ORDER)
             try:
                 delta_c = generalized_mbll(od_filt[:, -1:], wavelengths, dpfs, det.distance_cm)
@@ -260,8 +344,39 @@ class MainWindow(QtWidgets.QWidget):
                 curve["time"].append(elapsed)
                 curve["value"].append(float(delta_c[idx, -1]))
 
+        if len(DETECTOR_CHANNELS) >= 2:
+            short_detector = min(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+            long_detector = max(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+            if short_detector.name != long_detector.name:
+                corrected_prefix = f"{long_detector.name}_ssr"
+                try:
+                    corrected_od, _ = short_separation_regression(
+                        detector_od[long_detector.code],
+                        detector_od[short_detector.code],
+                    )
+                    corrected_od_filt = smart_bandpass(
+                        corrected_od,
+                        fs,
+                        lowcut=BP_LOW_HZ,
+                        highcut=BP_HIGH_HZ,
+                        order=BP_ORDER,
+                    )
+                    corrected_c = generalized_mbll(
+                        corrected_od_filt[:, -1:],
+                        wavelengths,
+                        dpfs,
+                        long_detector.distance_cm,
+                    )
+                except Exception as exc:
+                    self.status.setText(f"SSR MBLL 计算失败: {exc}")
+                    return
+                for idx, chrom in enumerate(CHROMOPHORE_TYPES):
+                    curve = self.curve_data[(corrected_prefix, chrom)]
+                    curve["time"].append(elapsed)
+                    curve["value"].append(float(corrected_c[idx, -1]))
+
         self.last_mbll_time = elapsed
-        self.status.setText(f"HbO/HbR/Cyt updated t={elapsed:.2f}s (Cyt UCL extinction)")
+        self.status.setText(f"HbO/HbR/Cyt updated t={elapsed:.2f}s (SSR included)")
 
     def _update_plot(self):
         t_max = 0.0

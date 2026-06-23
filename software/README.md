@@ -128,7 +128,9 @@ Time (s),S1_D1_850,S1_D1_810,S1_D1_770,S1_D1_730,S1_D1_700,S1_D2_850,...
 ### `processed_output.csv`
 
 ```text
-Time,S1_D1_hbo,S1_D1_hbr,S1_D1_cyt,S1_D2_hbo,S1_D2_hbr,S1_D2_cyt
+Time,S1_D1_hbo,S1_D1_hbr,S1_D1_cyt,S1_D2_hbo,S1_D2_hbr,S1_D2_cyt,S1_D1_ssr_hbo,S1_D1_ssr_hbr,S1_D1_ssr_cyt
 ```
+
+`S1_D1_ssr_*` uses `S1_D2` as the short-separation shallow reference and removes wavelength-wise correlated OD fluctuations before MBLL.
 
 `cyt` uses the UCL-NIR-Spectra cytochrome oxidase difference extinction spectrum (`OD / cm / mM`), converted internally to `OD / cm / M` to match HbO/HbR. Experimental calibration is still recommended before interpreting it as a validated absolute concentration.

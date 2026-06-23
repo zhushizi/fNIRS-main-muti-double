@@ -20,6 +20,7 @@
   -> process_csv_dataset
       -> 2 接收源 x 5 波长矩阵
       -> intensities_to_od_changes
+      -> short_separation_regression (S1_D2 作为浅层参考校正 S1_D1)
       -> smart_bandpass
       -> generalized_mbll
   -> processed_output.csv
@@ -195,6 +196,14 @@ delta_od = nsp.intensities_to_od_changes(samples)
 - `S1_D2` 距离 `1.0cm`
 - 色团输出 `hbo / hbr / cyt`
 
+另外会把最短距离通道 `S1_D2` 作为浅层参考，对最长距离通道 `S1_D1` 做逐波长短距回归：
+
+```text
+OD_S1_D1_ssr(lambda) = OD_S1_D1(lambda) - beta(lambda) * (OD_S1_D2(lambda) - mean(OD_S1_D2(lambda)))
+```
+
+校正后的 OD 再按 `S1_D1` 的 `3.0cm` 距离进入 MBLL，输出 `S1_D1_ssr_hbo / hbr / cyt`。
+
 最终输出：
 
 - `S1_D1_hbo`
@@ -203,11 +212,14 @@ delta_od = nsp.intensities_to_od_changes(samples)
 - `S1_D2_hbo`
 - `S1_D2_hbr`
 - `S1_D2_cyt`
+- `S1_D1_ssr_hbo`
+- `S1_D1_ssr_hbr`
+- `S1_D1_ssr_cyt`
 
 ### 5.6 `processed_output.csv` 结构
 
 ```text
-Time,S1_D1_hbo,S1_D1_hbr,S1_D1_cyt,S1_D2_hbo,S1_D2_hbr,S1_D2_cyt
+Time,S1_D1_hbo,S1_D1_hbr,S1_D1_cyt,S1_D2_hbo,S1_D2_hbr,S1_D2_cyt,S1_D1_ssr_hbo,S1_D1_ssr_hbr,S1_D1_ssr_cyt
 ```
 
 这仍然保持旧版的输出风格：

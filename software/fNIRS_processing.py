@@ -6,7 +6,7 @@
 2. 写入 all_groups.csv
 3. 对每个接收源/波长组合做阈值/低通/RMS 预处理
 4. 聚合成 2 接收源 x 5 波长光强宽表
-5. 计算 OD -> 广义 MBLL -> HbO/HbR/Cyt
+5. 计算 OD -> 短距回归校正 -> 广义 MBLL -> HbO/HbR/Cyt
 6. 输出 processed_output.csv
 """
 
@@ -253,6 +253,37 @@ def stack_intensities_for_detector(df: pd.DataFrame, detector) -> np.ndarray:
     )
 
 
+def short_separation_regression(
+    long_od: np.ndarray,
+    short_od: np.ndarray,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    用短距 OD 的波动成分作为浅层参考，逐波长回归校正长距 OD。
+
+    返回:
+    - corrected_long_od: 校正后的长距 OD，形状与 long_od 相同
+    - beta: 每个波长的浅层耦合系数，形状为 (n_wavelengths,)
+    """
+    if long_od.shape != short_od.shape:
+        raise ValueError("long_od and short_od must have the same shape.")
+    if long_od.ndim != 2:
+        raise ValueError("OD matrices must be shaped as (n_wavelengths, n_timepoints).")
+
+    short_centered = short_od - np.mean(short_od, axis=1, keepdims=True)
+    long_centered = long_od - np.mean(long_od, axis=1, keepdims=True)
+    denominator = np.sum(short_centered * short_centered, axis=1)
+    numerator = np.sum(long_centered * short_centered, axis=1)
+    beta = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator, dtype=float),
+        where=denominator > eps,
+    )
+    corrected = long_od - beta[:, np.newaxis] * short_centered
+    return corrected, beta
+
+
 def butter_bandpass_sos(lowcut: float, highcut: float, fs: float, order: int = 4):
     """构造带通滤波器的 SOS 形式。"""
     nyq = 0.5 * fs
@@ -369,10 +400,12 @@ def process_csv_dataset(
     outputs: list[np.ndarray] = []
     processed_headers: list[str] = []
     table_data = []
+    detector_delta_od: dict[str, np.ndarray] = {}
 
     for detector in DETECTOR_CHANNELS:
         samples = stack_intensities_for_detector(df, detector)
         delta_od = nsp.intensities_to_od_changes(samples)
+        detector_delta_od[detector.name] = delta_od
         delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
         delta_c = generalized_mbll(
             delta_od_filt,
@@ -385,6 +418,42 @@ def process_csv_dataset(
         for chrom_idx, chrom_type in enumerate(CHROMOPHORE_TYPES):
             processed_headers.append(f"{detector.name}_{chrom_type}")
             table_data.append([detector.name, chrom_type, f"{delta_c[chrom_idx, -1]:.4e}"])
+
+    if len(DETECTOR_CHANNELS) >= 2:
+        short_detector = min(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+        long_detector = max(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+        if short_detector.name != long_detector.name:
+            corrected_od, beta = short_separation_regression(
+                detector_delta_od[long_detector.name],
+                detector_delta_od[short_detector.name],
+            )
+            corrected_od_filt = smart_bandpass(
+                corrected_od,
+                fs,
+                lowcut=bp_low,
+                highcut=bp_high,
+                order=bp_order,
+            )
+            corrected_c = generalized_mbll(
+                corrected_od_filt,
+                wavelengths,
+                dpfs,
+                long_detector.distance_cm,
+                table=molar_ext_coeff_table,
+            )
+            outputs.append(corrected_c)
+            corrected_prefix = f"{long_detector.name}_ssr"
+            for chrom_idx, chrom_type in enumerate(CHROMOPHORE_TYPES):
+                processed_headers.append(f"{corrected_prefix}_{chrom_type}")
+                table_data.append([corrected_prefix, chrom_type, f"{corrected_c[chrom_idx, -1]:.4e}"])
+            beta_text = ", ".join(
+                f"{wl.emitter_nm:g}nm={wl_beta:.4g}" for wl, wl_beta in zip(WAVELENGTH_CHANNELS, beta)
+            )
+            print(
+                f"Short-separation regression: {short_detector.name} ({short_detector.distance_cm:g} cm) "
+                f"used as shallow reference for {long_detector.name} ({long_detector.distance_cm:g} cm)."
+            )
+            print(f"SSR beta by wavelength: {beta_text}")
 
     delta_c_all = np.vstack(outputs)
     header_out = ["Time"] + processed_headers
@@ -411,9 +480,8 @@ def capture_data(
     采集双接收源五波长原始数据并写 CSV。
 
     每收到一帧 0x02 数据帧就：
-    1. 回 ACK
-    2. 解析波长/传感器/采样值
-    3. 记录到 all_groups.csv
+    1. 解析波长/传感器/采样值
+    2. 记录到 all_groups.csv
     """
     ser = open_serial() # 打开串口
     reader = FrameReader(ser) # 创建帧读取器
