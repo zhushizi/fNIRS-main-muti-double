@@ -427,6 +427,7 @@ def process_csv_dataset(
                 detector_delta_od[long_detector.name],
                 detector_delta_od[short_detector.name],
             )
+            # 对校正后的 OD 数据做稳健带通。
             corrected_od_filt = smart_bandpass(
                 corrected_od,
                 fs,
