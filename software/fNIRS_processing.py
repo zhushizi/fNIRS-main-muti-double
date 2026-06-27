@@ -357,6 +357,25 @@ def _extinction_matrix(wavelengths: list[float], table: str = "wray") -> np.ndar
     return np.column_stack([hb_ex, cyt])
 
 
+def _cyt_extinction_vector(wavelengths: list[float]) -> np.ndarray:
+    """返回 Cyt/oxCCO 差分消光系数向量，单位与 HbO/HbR 保持一致。"""
+    return np.asarray([CYT_DIFFERENCE_EXTINCTION[float(wl)] for wl in wavelengths], dtype=float) * 1000.0
+
+
+def generalized_mbll_hb(
+    delta_od: np.ndarray,
+    wavelengths: list[float],
+    dpfs: list[float],
+    distance_cm: float,
+    table: str = "wray",
+) -> np.ndarray:
+    """用五波长最小二乘只反演 HbO/HbR，返回 (2, n_timepoints)。"""
+    hb_ex = _hemoglobin_extinctions(wavelengths, table)
+    pathlength = np.asarray(dpfs, dtype=float) * float(distance_cm)
+    a_hb = hb_ex * pathlength[:, np.newaxis]
+    return np.linalg.pinv(a_hb) @ delta_od
+
+
 def generalized_mbll(
     delta_od: np.ndarray,
     wavelengths: list[float],
@@ -364,11 +383,26 @@ def generalized_mbll(
     distance_cm: float,
     table: str = "wray",
 ) -> np.ndarray:
-    """用五波长最小二乘反演 HbO/HbR/Cyt，返回 (3, n_timepoints)。"""
-    ex = _extinction_matrix(wavelengths, table)
+    """
+    分步广义 MBLL：先稳定反演 HbO/HbR，再从 Hb 残差中估计 Cyt。
+
+    返回行顺序仍为 (HbO, HbR, Cyt)，以保持 processed_output.csv 列名兼容。
+    """
+    hb_ex = _hemoglobin_extinctions(wavelengths, table)
+    cyt_ex = _cyt_extinction_vector(wavelengths)
     pathlength = np.asarray(dpfs, dtype=float) * float(distance_cm)
-    a_matrix = ex * pathlength[:, np.newaxis]
-    return np.linalg.pinv(a_matrix) @ delta_od
+    a_hb = hb_ex * pathlength[:, np.newaxis]
+    a_cyt = (cyt_ex * pathlength)[:, np.newaxis]
+
+    hb_delta_c = np.linalg.pinv(a_hb) @ delta_od
+    hb_fit_od = a_hb @ hb_delta_c
+    residual_od = delta_od - hb_fit_od
+
+    # 只使用 Cyt 光谱中不能被 HbO/HbR 解释的部分，降低 cyt 的不确定性对 HbO/HbR 的污染。
+    hb_projection = a_hb @ np.linalg.pinv(a_hb)
+    cyt_residual_basis = a_cyt - hb_projection @ a_cyt
+    cyt_delta_c = np.linalg.pinv(cyt_residual_basis) @ residual_od
+    return np.vstack([hb_delta_c, cyt_delta_c])
 
 
 def process_csv_dataset(

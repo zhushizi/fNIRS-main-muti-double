@@ -46,7 +46,7 @@ from fNIRS_processing import (
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "result_table" / "2026-06-24_14-25-15" / "all_groups.csv"
+DEFAULT_INPUT = SCRIPT_DIR / "result_table" / "2026-06-27_10-30-58" / "all_groups.csv"
 HEMOGLOBIN_TYPES: tuple[str, str] = ("hbo", "hbr")
 
 

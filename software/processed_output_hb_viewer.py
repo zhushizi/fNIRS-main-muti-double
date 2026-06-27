@@ -22,7 +22,7 @@ from PyQt5 import QtWidgets
 from processed_output_viewer import ProcessedOutputViewer
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "result_table" / "2026-06-24_15-50-55" / "processed_output_hb.csv"
+DEFAULT_INPUT = SCRIPT_DIR / "result_table" / "2026-06-27_14-26-18" / "processed_output_hb.csv"
 
 
 class ProcessedOutputHbViewer(ProcessedOutputViewer):
