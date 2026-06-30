@@ -20,7 +20,7 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "result_table" / "2026-06-27_14-05-21" / "processed_output.csv"
+DEFAULT_INPUT = SCRIPT_DIR / "result_table" / "2026-06-29_14-43-08" / "processed_output.csv"
 
 TIME_CANDIDATES = ("Time", "Time (s)")
 
